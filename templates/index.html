@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Upload e Análise de Certidão</title>
+    <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+    <div class="container">
+        <h1>Upload e Análise de Certidão</h1>
+        <form id="uploadForm">
+            <div id="dropZone" class="drop-zone">
+                <p>Arraste o PDF da matrícula aqui ou clique para selecionar</p>
+                <input type="file" id="fileInput" name="file" accept="application/pdf" hidden />
+                <button type="button" id="selectFileBtn">Selecionar Arquivo</button>
+            </div>
+            <button type="submit" id="uploadBtn" disabled>Enviar para Análise</button>
+        </form>
+
+        <div id="loading" class="hidden">Analisando documento... Por favor, aguarde.</div>
+
+        <div id="result" class="hidden">
+            <h2>✔ Análise Concluída</h2>
+            <button id="copyBtn" title="Copiar relatório">📋 Copiar</button>
+            <a id="downloadLink" href="#" download>⬇ Baixar TXT</a>
+
+            <div class="grid">
+                <div class="card" id="cartorio"></div>
+                <div class="card" id="dataBusca"></div>
+                <div class="card" id="dataCertidao"></div>
+                <div class="card" id="diagnostico"></div>
+                <div class="card" id="endereco"></div>
+                <div class="card" id="fracaoIdeal"></div>
+                <div class="card" id="matricula"></div>
+                <div class="card" id="proprietarios"></div>
+                <div class="card" id="onusReais"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
