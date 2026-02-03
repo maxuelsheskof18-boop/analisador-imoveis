@@ -4,156 +4,227 @@ import re
 import requests
 import pdfplumber
 import pytesseract
-import platform  # <--- NOVA IMPORTAÇÃO IMPORTANTE
+import platform
 from pdf2image import convert_from_path
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.utils import secure_filename
 from collections import Counter
+from flask_cors import CORS
 
 # --- CONFIGURAÇÃO ---
 app = Flask(__name__)
+CORS(app)  # Habilita CORS (útil para testes via browser)
 
-# --- CONFIGURAÇÃO INTELIGENTE (DETECTA WINDOWS OU LINUX/CPANEL) ---
+# --- DETECÇÃO DE AMBIENTE (Windows vs Linux) ---
 sistema_operacional = platform.system()
 
 if sistema_operacional == "Windows":
-    # Configurações do seu PC Local
     print(">>> Ambiente detectado: WINDOWS (Local)")
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    # Ajuste abaixo para o caminho real do poppler no seu PC se necessário
     poppler_dir = r"C:\poppler\Library\bin"
-    
-    # Adiciona Poppler ao PATH se não estiver
     if os.path.exists(poppler_dir) and poppler_dir not in os.environ.get('PATH', ''):
         os.environ['PATH'] += ";" + poppler_dir
-
+    POPPLER_PATH = poppler_dir
 else:
-    # Configurações do Servidor Linux (cPanel)
     print(">>> Ambiente detectado: LINUX (Servidor)")
-    # No Linux, o Tesseract geralmente está no caminho padrão
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-    # O Poppler já costuma vir instalado no sistema, não precisa de PATH extra
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # padrão Linux
+    POPPLER_PATH = None  # No Linux, normalmente não precisa informar o caminho
 
-# Chave Groq 
-# (Mantenha sua chave segura. Cole-a abaixo novamente)
-GROQ_API_KEY = "COLE_SUA_CHAVE_GROQ_AQUI" 
+# --- CHAVE GROQ (LEIA DE VARIÁVEL DE AMBIENTE, COM FALLBACK SE VOCÊ JÁ A PASSOU) ---
+# É fortemente recomendado setar GROQ_API_KEY como variável de ambiente no Render:
+# Ex.: GROQ_API_KEY = 'gsk_...'
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
+# --- PASTAS ---
 UPLOAD_FOLDER = 'uploads'
 REPORT_FOLDER = 'relatorios'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(REPORT_FOLDER, exist_ok=True)
 
-# ---------------- LEITURA (OCR) ----------------
+# ---------------- LEITURA (TENTA PDFPLUMBER ANTES DO OCR) ----------------
 def extrair_texto(caminho_pdf):
-    print(f"Lendo PDF: {caminho_pdf}")
+    """
+    Tenta extrair texto diretamente do PDF (pdfplumber). Se vazio ou pouca coisa,
+    faz OCR página-a-página com pytesseract + pdf2image.
+    """
+    print(f"[INFO] Lendo PDF: {caminho_pdf}")
     texto = ""
+
+    # 1) Tenta pdfplumber (funciona quando o PDF já tem texto)
     try:
-        # PSM 4: Assume texto de coluna única (ideal para RGI)
-        paginas = convert_from_path(caminho_pdf, 300)
-        for img in paginas:
-            texto += pytesseract.image_to_string(img, lang='por', config='--psm 4') + "\n"
+        with pdfplumber.open(caminho_pdf) as pdf:
+            paginas = []
+            for p in pdf.pages:
+                t = p.extract_text() or ""
+                paginas.append(t)
+            texto_plumber = "\n".join(paginas).strip()
+            if texto_plumber and len(texto_plumber) > 50:
+                print("[INFO] Texto extraído via pdfplumber (sem OCR).")
+                return texto_plumber
     except Exception as e:
-        print(f"Erro OCR: {e}")
+        print(f"[WARN] pdfplumber falhou: {e}")
+
+    # 2) Fallback para OCR com pdf2image + pytesseract
+    try:
+        print("[INFO] Usando OCR (pytesseract) — isso pode demorar...")
+        # DPI 300 costuma dar boa qualidade para OCR
+        if POPPLER_PATH and sistema_operacional == "Windows":
+            imagens = convert_from_path(caminho_pdf, dpi=300, poppler_path=POPPLER_PATH)
+        else:
+            imagens = convert_from_path(caminho_pdf, dpi=300)
+        partes = []
+        for img in imagens:
+            # '--psm 4' funciona bem para textos com colunas simples; ajuste se necessário
+            txt = pytesseract.image_to_string(img, lang='por', config='--psm 4')
+            partes.append(txt)
+        texto = "\n".join(partes)
+        print(f"[INFO] OCR finalizado. {len(partes)} páginas processadas.")
+    except Exception as e:
+        print(f"[ERRO] Falha no OCR: {e}")
         return ""
+
     return texto
 
 # ---------------- IA (GROQ) ----------------
 def analisar_com_ia(texto):
-    # Verifica se a chave é válida (não é o placeholder)
-    if not GROQ_API_KEY or "COLE_SUA" in GROQ_API_KEY: 
+    """
+    Tenta enviar um prompt para a API Groq (OpenAI-compatible endpoint).
+    Retorna string JSON produzida pela IA (ou None em caso de falha).
+    """
+    if not GROQ_API_KEY or GROQ_API_KEY.strip() == "":
+        print("[INFO] Sem chave GROQ configurada.")
         return None
-        
-    try:
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        # Enviamos apenas o começo e o fim do texto para a IA não se perder
-        resumo_texto = texto[:5000] + "\n...[MEIO DO DOCUMENTO]...\n" + texto[-3000:]
-        prompt = f"Extraia JSON exato: Cartório (ex: 5º Ofício), Data da Certidão (ex: 02/10/2024), Matrícula, Endereço, Proprietários, Ônus. Texto: {resumo_texto}"
-        
-        resp = requests.post(url, headers=headers, json={"model": "llama3-70b-8192", "messages": [{"role": "user", "content": prompt}]}, timeout=30)
-        return resp.json()['choices'][0]['message']['content'] if resp.status_code == 200 else None
-    except: return None
 
-# ---------------- LÓGICA DE CARTORÁRIO (REGEX FINAL) ----------------
+    try:
+        # Endpoint compatível OpenAI (fornecido anteriormente); se necessário ajuste ao endpoint real da sua conta Groq
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        # Monta um prompt robusto e com limite de tamanho
+        resumo_texto = (texto[:6000] + "\n...[MEIO DO DOCUMENTO]...\n" + texto[-3000:]) if len(texto) > 9000 else texto
+        prompt = (
+            "Você é um assistente especializado em matrículas e certidões imobiliárias do Rio de Janeiro. "
+            "Extraia um JSON com as chaves: Cartório, Matrícula, Data da Certidão, Endereço, Proprietários (lista com nome e CPF se houver), Ônus (lista), Diagnóstico. "
+            "Retorne apenas JSON válido. Aqui está o texto:\n\n" + resumo_texto
+        )
+
+        payload = {
+            "model": "llama3-70b-8192",  # se esse modelo não existir na sua conta, ajuste conforme disponível
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1200,
+            "temperature": 0.0
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=40)
+        if resp.status_code != 200:
+            print(f"[WARN] Groq retornou status {resp.status_code}: {resp.text}")
+            return None
+
+        j = resp.json()
+        # Tenta navegar por formatos diferentes (compatível com OpenAI-like)
+        text_resp = None
+        if isinstance(j, dict):
+            # OpenAI-like
+            try:
+                text_resp = j['choices'][0]['message']['content']
+            except Exception:
+                # Algumas APIs retornam em 'choices'[0]['text']
+                try:
+                    text_resp = j['choices'][0].get('text')
+                except Exception:
+                    text_resp = None
+
+        if not text_resp:
+            print("[WARN] Resposta da IA não contém conteúdo esperado.")
+            return None
+
+        # Retorna a string — quem chama deve tentar json.loads
+        return text_resp.strip()
+
+    except Exception as e:
+        print(f"[ERRO] Falha ao chamar API Groq: {e}")
+        return None
+
+# ---------------- LÓGICA DE CARTORÁRIO (REGEX) ----------------
 def analisar_inteligencia_registral(texto):
-    print(">>> Iniciando Análise Lógica (Cartório e Data Reais)...")
-    
+    print(">>> Iniciando Análise Lógica (Regex)...")
     texto_limpo = re.sub(r'\s+', ' ', texto).upper()
-    
-    # 1. CARTÓRIO (Busca no cabeçalho - primeiros 1000 caracteres)
+
+    # CARTÓRIO
     cabecalho = texto_limpo[:1000]
-    cartorio = "Registro de Imóveis - RJ" # Padrão
-    
-    # Procura "Xº OFÍCIO" ou "Xº REGISTRO"
+    cartorio = "Registro de Imóveis - RJ"
     match_cartorio = re.search(r'(\d+)[º°ª]\s*(?:OF[ÍI]CIO|REGISTRO)', cabecalho)
     if match_cartorio:
         numero = match_cartorio.group(1)
         cartorio = f"{numero}º Ofício de Registro de Imóveis - RJ"
-    elif "9º OFÍCIO" in cabecalho: cartorio = "9º Ofício de Registro de Imóveis"
-    elif "5º OFÍCIO" in cabecalho: cartorio = "5º Ofício de Registro de Imóveis"
+    elif "5º OFÍCIO" in cabecalho:
+        cartorio = "5º Ofício de Registro de Imóveis - RJ"
+    elif "9º OFÍCIO" in cabecalho:
+        cartorio = "9º Ofício de Registro de Imóveis - RJ"
 
-    # 2. DATA DA CERTIDÃO (Busca no rodapé - últimos 2000 caracteres)
+    # DATA DA CERTIDÃO
     rodape = texto_limpo[-2000:]
-    data_certidao = datetime.now().strftime('%d/%m/%Y') # Default hoje
-    
-    # Procura padrão "RIO DE JANEIRO, 02 DE OUTUBRO DE 2024" ou "EM 01/10/2024"
+    data_certidao = datetime.now().strftime('%d/%m/%Y')
     match_data_extenso = re.search(r'RIO DE JANEIRO,?\s*(\d{1,2})\s*DE\s*([A-ZÇ]+)\s*DE\s*(\d{4})', rodape)
-    match_data_simples = re.search(r'(\d{2}/\d{2}/\d{4})', rodape)
-    
+    match_data_simples = re.findall(r'(\d{2}/\d{2}/\d{4})', rodape)
     if match_data_extenso:
         dia, mes, ano = match_data_extenso.groups()
         data_certidao = f"{dia} de {mes} de {ano}"
     elif match_data_simples:
-        # Pega a última data encontrada no documento (geralmente é a da assinatura)
-        todas_datas = re.findall(r'(\d{2}/\d{2}/\d{4})', rodape)
-        if todas_datas:
-            data_certidao = todas_datas[-1]
+        data_certidao = match_data_simples[-1]
 
-    # 3. MATRÍCULA (Lógica de contagem de repetições R.X/Num)
+    # MATRÍCULA
     matricula = "Não identificada"
-    candidatos_matricula = re.findall(r'[R|AV]\.\d+/(\d+[\.\d]*)', texto_limpo)
+    candidatos_matricula = re.findall(r'[RAV]\.?(\d{4,7})', texto_limpo)
     if candidatos_matricula:
-        matricula = Counter(candidatos_matricula).most_common(1)[0][0].replace('.', '')
+        matricula = Counter(candidatos_matricula).most_common(1)[0][0]
     else:
         match_topo = re.search(r'MATR[ÍI]CULA.*?(\d{4,7})', texto_limpo)
-        if match_topo: matricula = match_topo.group(1)
+        if match_topo:
+            matricula = match_topo.group(1)
 
-    # 4. PROPRIETÁRIOS
+    # PROPRIETÁRIOS
     proprietarios = []
-    matches_herdeiros = re.findall(r'(?:PARTILHADO [ÀA]|ADJUDICADO [ÀA]|TRANSFE[RI]+U PARA)\s*(.*?)(?:,|;|\.|\n)', texto_limpo)
-    for bloco in matches_herdeiros:
-        nomes_sujos = re.split(r'\d+\)', bloco)
-        for n in nomes_sujos:
-            n = re.sub(r'CPF.*?[\d\.\-]+', '', n).replace('BRASILEIRO', '').replace('SOLTEIRO', '').strip()
-            if len(n) > 5 and "MATRÍCULA" not in n: proprietarios.append({"nome": n})
-    
+    # Busca padrões de "NOME, CPF nnn.nnn.nnn-nn"
+    matches_cpf = re.findall(r'([A-Z\s\.\-]{6,200}?)\s+CPF[:\s]*([\d\.\-]{11,14})', texto_limpo)
+    for nome, cpf in matches_cpf:
+        n = nome.strip().title()
+        proprietarios.append({"nome": n, "cpf": cpf})
+
     if not proprietarios:
-        match_prop = re.search(r'(?:PROPRIET[ÁA]RIO|ADQUIRENTE).*?[-–]\s*(.*?)(?:;|\.|DO QUE)', texto_limpo)
-        if match_prop: proprietarios.append({"nome": match_prop.group(1).strip()})
-    
-    proprietarios = list({p['nome']: p for p in proprietarios}.values()) # Remove duplicatas
+        # tentativa genérica
+        generic_matches = re.findall(r'(PROPRIET[ÁA]RIO|ADQUIRENTE|PROPRIETARIOS?).{0,40}([A-Z][A-Z\s,]{4,200})', texto_limpo)
+        for gm in generic_matches:
+            n = re.sub(r'CPF.*', '', gm[1]).strip().title()
+            if len(n) > 4:
+                proprietarios.append({"nome": n})
 
-    # 5. ENDEREÇO
+    # ENDEREÇO
     endereco = "Endereço não localizado"
-    match_end = re.search(r'(?:IM[ÓO]VEL|PR[ÉE]DIO).*?((?:RUA|AV|AVENIDA|ALAMEDA).*?)(?:;|\.|$)', texto_limpo)
-    if match_end: endereco = match_end.group(1).strip()
+    match_end = re.search(r'(?:ENDEREÇOS?|ENDEREÇO|LOCALIZADO EM|SITUADO EM).*?((?:RUA|AVENIDA|AV|TRAVESSA|ALAMEDA|PRAÇA).{1,200}?)\.', texto_limpo)
+    if match_end:
+        endereco = match_end.group(1).strip().title()
+    else:
+        match_end2 = re.search(r'(?:AV\.|RUA|AVENIDA|PRAÇA|TRAVESSA)\s+[A-Z0-9\.\-\/\s]{4,200}', texto_limpo)
+        if match_end2:
+            endereco = match_end2.group(0).strip().title()
 
-    # 6. ÔNUS E DIAGNÓSTICO
+    # ÔNUS
+    termos_perigo = ["PENHORA", "HIPOTECA", "INDISPONIBILIDADE", "ARRESTO", "ARRESTOS", "AÇÃO DE EXECUÇÃO", "EXECUÇÃO"]
     onus_encontrados = []
-    termos_perigo = ["PENHORA", "HIPOTECA", "INDISPONIBILIDADE", "ARRESTO", "AÇÃO DE EXECUÇÃO"]
-    eh_negativa = "NÃO CONSTAM" in rodape or "INEXISTEM" in rodape
-    
     for termo in termos_perigo:
         if termo in texto_limpo:
-            idx = texto_limpo.find(termo)
-            contexto = texto_limpo[max(0, idx-50):min(len(texto_limpo), idx+50)]
-            if "CANCELAD" in contexto or "BAIXA" in contexto: continue
-            if eh_negativa and termo in ["AÇÕES REAIS", "REIPERSECUTÓRIAS"]: continue
-            if not eh_negativa: onus_encontrados.append(termo)
+            onus_encontrados.append(termo)
 
-    diagnostico = "Pode Vender (Livre)"
-    if onus_encontrados: diagnostico = "Atenção (Possíveis Ônus)"
-    elif not onus_encontrados: onus_encontrados = ["Nada consta (Livre de Ônus Reais)"]
+    diagnostico = "Pode Vender (Livre)" if not onus_encontrados else "Atenção (Possíveis Ônus)"
+
+    if not onus_encontrados:
+        onus_encontrados = ["Nada consta (Livre de Ônus Reais)"]
 
     return {
         "Cartório": cartorio,
@@ -173,32 +244,53 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files: return jsonify({"error": "Erro arquivo"}), 400
+    if 'file' not in request.files:
+        return jsonify({"error": "Erro: arquivo não enviado"}), 400
+
     file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "Erro: nome do arquivo inválido"}), 400
+
     filename = secure_filename(file.filename)
     path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(path)
+    print(f"[INFO] Arquivo salvo em: {path}")
 
+    # Extrai texto (pdfplumber -> OCR)
     texto = extrair_texto(path)
-    
-    # Tenta IA (se tiver chave e não for placeholder) ou vai para Lógica Registral
-    dados = analisar_com_ia(texto)
-    if dados:
-        try:
-            dados = json.loads(dados.replace('```json', '').replace('```', ''))
-        except:
-            dados = analisar_inteligencia_registral(texto)
-    else:
+    if not texto or len(texto.strip()) < 20:
+        print("[WARN] Texto extraído muito curto ou vazio; retornando análise padrão.")
         dados = analisar_inteligencia_registral(texto)
+    else:
+        # Tenta IA primeiro
+        resposta_ia = analisar_com_ia(texto)
+        if resposta_ia:
+            try:
+                # Remove possíveis blocos de código e tenta carregar JSON
+                cleaned = resposta_ia.strip().replace('```json', '').replace('```', '').strip()
+                dados = json.loads(cleaned)
+                print("[INFO] Dados extraídos via IA (JSON).")
+            except Exception as e:
+                print(f"[WARN] IA retornou mas não é JSON válido: {e}")
+                dados = analisar_inteligencia_registral(texto)
+        else:
+            dados = analisar_inteligencia_registral(texto)
 
-    with open(os.path.join(REPORT_FOLDER, "analise.txt"), "w", encoding="utf-8") as f:
+    # Salva relatório
+    nome_relatorio = f"analise_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    caminho_relatorio = os.path.join(REPORT_FOLDER, nome_relatorio)
+    with open(caminho_relatorio, "w", encoding="utf-8") as f:
         json.dump(dados, f, indent=2, ensure_ascii=False)
 
-    return jsonify({"relatorio": dados, "arquivo_relatorio": "analise.txt"})
+    return jsonify({"relatorio": dados, "arquivo_relatorio": nome_relatorio})
 
 @app.route('/download/<filename>')
 def download_file(filename):
     return send_from_directory(REPORT_FOLDER, filename, as_attachment=True)
 
+# ---------------- RUN ----------------
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Porta e host compatíveis com Render e execução local
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "False").lower() in ("1", "true", "yes")
+    app.run(host='0.0.0.0', port=port, debug=debug)
