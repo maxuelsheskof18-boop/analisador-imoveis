@@ -1,7 +1,10 @@
 flask
+flask-cors
+requests
 pdfplumber
 pytesseract
 pdf2image
-requests
+pillow
 werkzeug
 gunicorn
+groq
